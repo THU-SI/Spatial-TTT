@@ -163,4 +163,4 @@ If you find Spatial-TTT useful for your research, please cite:
 
 ## Acknowledgements
 
-Thanks to these great repositories and works: [Spatial-MLLM](https://github.com/THU-SI/Spatial-MLLM), [Qwen3-VL](https://github.com/QwenLM/Qwen3-VL), [Qwen-VL-Finetune](https://github.com/QwenLM/Qwen3-VL/tree/main/qwen-vl-finetune), [Test-Time Training Done Right (LaCT)](https://github.com/a1600012888/LaCT), and the spatial understanding community.
+Thanks to these great repositories and works: [Spatial-MLLM](https://github.com/THU-SI/Spatial-MLLM), [Qwen3-VL](https://github.com/QwenLM/Qwen3-VL), [Test-Time Training Done Right (LaCT)](https://github.com/a1600012888/LaCT), and the spatial understanding community.
