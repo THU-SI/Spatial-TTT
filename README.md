@@ -3,9 +3,9 @@
 # ✨ Spatial-TTT: Streaming Visual-based Spatial Intelligence with Test-Time Training ✨
 
 <p align="center">
-    <a href="https://liuff19.github.io/">Fangfu Liu</a><sup>*</sup>,
-    <a href="https://github.com/diankun-wu/">Diankun Wu</a><sup>*</sup>,
-    <a href="https://chijw.github.io/">Jiawei Chi</a><sup>*</sup>,
+    <a href="https://liuff19.github.io/">Fangfu Liu</a><sup>*,1</sup>,
+    <a href="https://github.com/diankun-wu/">Diankun Wu</a><sup>*,1</sup>,
+    <a href="https://chijw.github.io/">Jiawei Chi</a><sup>*,1</sup>,
     Yimo Cai<sup>1</sup>,
     Yi-Hsin Hung<sup>1</sup>,
     <a href="https://yuxumin.github.io/">Xumin Yu</a><sup>2</sup>,
