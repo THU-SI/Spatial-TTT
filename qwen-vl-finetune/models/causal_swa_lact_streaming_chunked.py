@@ -8,19 +8,25 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from .causal_swa_lact import (
-    FLASH_ATTN_AVAILABLE,
+    ALL_ATTENTION_FUNCTIONS,
     LaCTCache,
     LaCTLayerState,
     Qwen3VLLaCTSWIGLULayer,
     apply_partial_rotary_pos_emb,
     apply_rotary_pos_emb,
     flash_attn_varlen_func,
+    _get_kv_cache_layer,
+    _set_kv_cache_layer,
     l2_norm,
     silu_backprop,
     zeropower_via_newtonschulz5,
+)
+from .ttt_operation_fused_kernel import (
+    fused_lact_swiglu_ffn_fast_weight_grads,
+    fused_swiglu_ffn_fwd,
+    l2_norm_add_fused,
 )
 
 
@@ -109,26 +115,25 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
         seq_len: int,
         chunk_size: int,
         video_mask: Optional[torch.Tensor],
+        video_index: Optional[_VideoIndex] = None,
     ) -> list[tuple[int, int]]:
         if chunk_size <= 0 or chunk_size >= seq_len:
             return [(0, seq_len)]
 
-        if video_mask is None:
+        if video_mask is None or video_index is None:
             return [
                 (i, min(i + chunk_size, seq_len)) for i in range(0, seq_len, chunk_size)
             ]
-
-        mask = video_mask
-        if mask.dim() > 1:
-            mask = mask[0]
 
         chunks = []
         start = 0
         while start < seq_len:
             end = min(start + chunk_size, seq_len)
-            if end < seq_len and mask[end - 1]:
-                while end < seq_len and mask[end]:
-                    end += 1
+            if end < seq_len:
+                frame_id = int(video_index.token_pos_to_frame[end - 1].item())
+                if frame_id >= 0:
+                    frame_end = int(video_index.frame_token_positions[frame_id][-1]) + 1
+                    end = max(end, min(frame_end, seq_len))
             chunks.append((start, end))
             start = end
         return chunks
@@ -207,6 +212,26 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
         video_tokens = rearrange(video_tokens, "t (h w) c -> 1 c t h w", h=h, w=w)
         video_conv = conv_layer(video_tokens)
         return rearrange(video_conv, "1 c t h w -> t (h w) c")
+
+    def _apply_full_video_conv(
+        self,
+        x: torch.Tensor,
+        conv_layer: torch.nn.Module,
+        video_mask: torch.Tensor,
+        video_index: _VideoIndex,
+    ) -> torch.Tensor:
+        video_tokens = x[video_mask]
+        video_reshaped = rearrange(
+            video_tokens,
+            "(n t h w) c -> n c t h w",
+            n=video_index.num_videos,
+            t=video_index.frames_per_video,
+            h=video_index.h,
+            w=video_index.w,
+        )
+        video_conv = conv_layer(video_reshaped)
+        x[video_mask] = rearrange(video_conv, "n c t h w -> (n t h w) c")
+        return x
 
     def _apply_streaming_conv(
         self,
@@ -381,6 +406,87 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
 
         return fw_w0, fw_w1, fw_w2, dw0_momentum, dw1_momentum, dw2_momentum
 
+    def _update_fast_weights_fused(
+        self,
+        fw_w0: torch.Tensor,
+        fw_w1: torch.Tensor,
+        fw_w2: torch.Tensor,
+        w0_norm: torch.Tensor,
+        w1_norm: torch.Tensor,
+        w2_norm: torch.Tensor,
+        dw0_momentum: Optional[torch.Tensor],
+        dw1_momentum: Optional[torch.Tensor],
+        dw2_momentum: Optional[torch.Tensor],
+        fast_k: torch.Tensor,
+        fast_v: torch.Tensor,
+        lr0: torch.Tensor,
+        lr1: torch.Tensor,
+        lr2: torch.Tensor,
+        momentum: Optional[torch.Tensor],
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        w0_w2 = torch.cat([fw_w0, fw_w2], dim=1).contiguous()
+        w0_w2_bf16 = w0_w2.to(torch.bfloat16)
+        fw_w1_bf16 = fw_w1.to(torch.bfloat16)
+        dw0_dw2, dw1 = fused_lact_swiglu_ffn_fast_weight_grads(
+            w0_w2_bf16,
+            fw_w1_bf16,
+            fast_k.to(torch.bfloat16),
+            fast_v.to(torch.bfloat16),
+            lr0.squeeze(-1),
+            lr1.squeeze(-1),
+            lr2.squeeze(-1),
+        )
+        dw0, dw2 = dw0_dw2.chunk(2, dim=1)
+
+        if momentum is not None and dw0_momentum is not None:
+            m_i = momentum.mean(dim=1, keepdim=True)
+            dw0 = dw0 + dw0_momentum * m_i
+            dw1 = dw1 + dw1_momentum * m_i
+            dw2 = dw2 + dw2_momentum * m_i
+            dw0_momentum = dw0
+            dw1_momentum = dw1
+            dw2_momentum = dw2
+
+        if self.use_muon:
+            dw0 = zeropower_via_newtonschulz5(dw0)
+            dw1 = zeropower_via_newtonschulz5(dw1)
+            dw2 = zeropower_via_newtonschulz5(dw2)
+
+        fw_w0 = l2_norm_add_fused(fw_w0, dw0, w0_norm, eps=1e-5, tgt_dtype=fw_w0.dtype)
+        fw_w1 = l2_norm_add_fused(fw_w1, dw1, w1_norm, eps=1e-5, tgt_dtype=fw_w1.dtype)
+        fw_w2 = l2_norm_add_fused(fw_w2, dw2, w2_norm, eps=1e-5, tgt_dtype=fw_w2.dtype)
+
+        return fw_w0, fw_w1, fw_w2, dw0_momentum, dw1_momentum, dw2_momentum
+
+    def _ttt_forward_chunk(
+        self,
+        fw_w0: torch.Tensor,
+        fw_w1: torch.Tensor,
+        fw_w2: torch.Tensor,
+        fast_q: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.use_fused_kernel:
+            w0_w2 = torch.cat([fw_w0, fw_w2], dim=1).contiguous()
+            return fused_swiglu_ffn_fwd(
+                w0_w2.to(torch.bfloat16),
+                fw_w1.to(torch.bfloat16),
+                fast_q.to(torch.bfloat16),
+            )
+
+        q_t = fast_q.transpose(1, 2)
+        if self.fp32_states:
+            q_t = q_t.float()
+        h = torch.bmm(fw_w2, q_t)
+        gate = F.silu(torch.bmm(fw_w0, q_t), inplace=True)
+        return torch.bmm(fw_w1, gate * h).transpose(1, 2)
+
     def _forward_prefill_streaming(
         self,
         hidden_states: torch.Tensor,
@@ -429,247 +535,100 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
         pending_lr2 = None
         pending_momentum = None
         pending_start = None
-        tail_k = None
-        tail_v = None
-        tail_lr0 = None
-        tail_lr1 = None
-        tail_lr2 = None
-        tail_momentum = None
         update_cutoff = max(seq_len - self.lact_chunk_size, 0)
-
-        output = torch.empty_like(hidden_states)
-        ttt_output = torch.empty_like(hidden_states)
 
         video_mask = kwargs.get("video_mask", None)
         if video_mask is not None and video_mask.dim() > 2:
             video_mask = video_mask[..., 0]
 
         video_index = None
-        prev_frame_cache_ttt: Dict[
-            int, Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = {}
         if self.use_conv_layer and video_mask is not None:
             video_grid_thw = kwargs.get("video_grid_thw", None)
             if video_grid_thw is None:
                 raise RuntimeError("video_grid_thw required when use_conv_layer=True.")
             video_index = self._build_video_index(video_mask, video_grid_thw, seq_len)
 
-        ttt_chunks = self._build_chunk_ranges(seq_len, self.lact_chunk_size, video_mask)
-        attn_chunks = self._build_chunk_ranges(
-            seq_len, self.attn_chunk_size, video_mask
+        ttt_chunks = self._build_chunk_ranges(
+            seq_len, self.lact_chunk_size, None, None
         )
+        attn_chunks = self._build_chunk_ranges(seq_len, self.attn_chunk_size, None, None)
 
-        use_varlen_attn = (
-            FLASH_ATTN_AVAILABLE
-            and self.config._attn_implementation == "flash_attention_2"
-        )
+        use_varlen_attn = self.config._attn_implementation == "flash_attention_2"
         attention_interface = None
         if not use_varlen_attn:
             attention_interface = ALL_ATTENTION_FUNCTIONS[
                 self.config._attn_implementation
             ]
 
-        for chunk_start, chunk_end in ttt_chunks:
-            hs_chunk = hidden_states[:, chunk_start:chunk_end, :]
-            cos = cos_full[:, chunk_start:chunk_end, :]
-            sin = sin_full[:, chunk_start:chunk_end, :]
-
-            q_normed, k_normed, v, q_flat, k_flat, v_expanded = self._compute_qkv(
-                hs_chunk
+        inline_attention = ttt_chunks == attn_chunks
+        combined_output = torch.empty_like(hidden_states)
+        ttt_output = None if inline_attention else torch.empty_like(hidden_states)
+        local_key_states = None
+        local_value_states = None
+        cache_seen_tokens = None
+        if past_key_values is not None:
+            cache_seen_tokens = getattr(past_key_values, "_seen_tokens", None)
+            local_key_states, local_value_states = _get_kv_cache_layer(
+                past_key_values, self.layer_idx
             )
 
-            if self.use_conv_layer and video_index is not None:
-                q_flat, k_flat, v_expanded = self._apply_streaming_conv(
-                    q_flat,
-                    k_flat,
-                    v_expanded,
-                    hidden_states,
-                    chunk_start,
-                    chunk_end,
-                    video_index,
-                    prev_frame_cache_ttt,
-                )
+        (
+            q_normed_full,
+            k_normed_full,
+            v_full,
+            q_flat_full,
+            k_flat_full,
+            v_expanded_full,
+        ) = self._compute_qkv(hidden_states)
 
-            fast_q, fast_k, fast_v = self._prepare_fast_qkv(
-                q_flat, k_flat, v_expanded, cos, sin
+        if self.use_conv_layer and video_index is not None:
+            q_flat_full = self._apply_full_video_conv(
+                q_flat_full, self.conv_q, video_mask, video_index
+            )
+            k_flat_full = self._apply_full_video_conv(
+                k_flat_full, self.conv_k, video_mask, video_index
+            )
+            v_expanded_full = self._apply_full_video_conv(
+                v_expanded_full, self.conv_v, video_mask, video_index
             )
 
-            lr = self.lr_proj(hs_chunk)
-            if self.lr_parameterization == "mamba":
-                lr = F.softplus(lr.float() + self.base_lr_inv)
-            fw_lr = rearrange(lr, "b s (h d) -> (b h) s d", h=self.num_fw_heads)
-            fw_lr1, fw_lr2, fw_lr3 = fw_lr.chunk(3, dim=-1)
+        lr_full = self.lr_proj(hidden_states)
+        if self.lr_parameterization == "mamba":
+            lr_full = F.softplus(lr_full.float() + self.base_lr_inv)
+        fw_lr_full = rearrange(
+            lr_full, "b s (h d) -> (b h) s d", h=self.num_fw_heads
+        )
+        fw_lr1_full, fw_lr2_full, fw_lr3_full = fw_lr_full.chunk(3, dim=-1)
 
-            if self.use_momentum:
-                momentum = self.momentum_proj(hs_chunk).float()
-                momentum = rearrange(
-                    momentum, "b s (h d) -> (b h) s d", h=self.num_fw_heads
-                )
-            else:
-                momentum = None
+        if self.use_momentum:
+            momentum_full = self.momentum_proj(hidden_states).float()
+            momentum_full = rearrange(
+                momentum_full, "b s (h d) -> (b h) s d", h=self.num_fw_heads
+            )
+        else:
+            momentum_full = None
 
-            ttt_chunk = torch.empty_like(hs_chunk)
-            cursor = 0
-            while cursor < fast_q.shape[1]:
-                pending_len = 0 if pending_k is None else pending_k.shape[1]
-                step = min(
-                    self.lact_chunk_size - pending_len,
-                    fast_q.shape[1] - cursor,
-                )
-                if step <= 0:
-                    raise RuntimeError(
-                        "LaCT streaming chunked hit non-positive step; "
-                        f"pending_len={pending_len}, cursor={cursor}, "
-                        f"seq_len={seq_len}, update_cutoff={update_cutoff}."
-                    )
-                seg_global_start = chunk_start + cursor
+        if self.learnable_ttt_scale:
+            ttt_scale_full = F.silu(self.ttt_scale_proj(hidden_states), inplace=False)
+            ttt_scale_full = rearrange(
+                ttt_scale_full,
+                "b s (n d) -> (b n) s d",
+                n=self.num_fw_heads,
+            )
+        else:
+            ttt_scale_full = None
 
-                fast_q_seg = fast_q[:, cursor : cursor + step, :]
-                fast_k_seg = fast_k[:, cursor : cursor + step, :]
-                fast_v_seg = fast_v[:, cursor : cursor + step, :]
-                lr0_seg = fw_lr1[:, cursor : cursor + step, :]
-                lr1_seg = fw_lr2[:, cursor : cursor + step, :]
-                lr2_seg = fw_lr3[:, cursor : cursor + step, :]
-                momentum_seg = (
-                    momentum[:, cursor : cursor + step, :]
-                    if momentum is not None
-                    else None
-                )
-
-                q_t = fast_q_seg.transpose(1, 2)
-                v_t = fast_v_seg.transpose(1, 2)
-                if self.fp32_states:
-                    q_t = q_t.float()
-                    v_t = v_t.float()
-
-                h = torch.bmm(fw_w2, q_t)
-                gate = F.silu(torch.bmm(fw_w0, q_t), inplace=True)
-                fw_x = torch.bmm(fw_w1, gate * h).transpose(1, 2)
-
-                ttt_x_normed = self.ttt_norm(fw_x)
-                if self.learnable_ttt_scale:
-                    ttt_scale = F.silu(
-                        self.ttt_scale_proj(hs_chunk[:, cursor : cursor + step, :]),
-                        inplace=False,
-                    )
-                    ttt_scale = rearrange(
-                        ttt_scale, "b s (n d) -> (b n) s d", n=self.num_fw_heads
-                    )
-                    ttt_x_normed = ttt_x_normed * ttt_scale
-
-                ttt_seg = rearrange(
-                    ttt_x_normed,
-                    "(b n) s d -> b s (n d)",
-                    n=self.num_fw_heads,
-                    b=batch_size,
-                )
-                ttt_chunk[:, cursor : cursor + step, :] = ttt_seg.type_as(hidden_states)
-
-                fast_k_seg = fast_k_seg.float() if self.fp32_states else fast_k_seg
-
-                if tail_k is None:
-                    tail_k = fast_k_seg
-                    tail_v = fast_v_seg
-                else:
-                    tail_k = torch.cat([tail_k, fast_k_seg], dim=1)
-                    tail_v = torch.cat([tail_v, fast_v_seg], dim=1)
-
-                if tail_k.shape[1] > self.lact_chunk_size:
-                    tail_k = tail_k[:, -self.lact_chunk_size :, :]
-                    tail_v = tail_v[:, -self.lact_chunk_size :, :]
-
-                if pending_k is None:
-                    pending_k = fast_k_seg
-                    pending_v = fast_v_seg
-                    pending_lr0 = lr0_seg
-                    pending_lr1 = lr1_seg
-                    pending_lr2 = lr2_seg
-                    pending_momentum = momentum_seg
-                    pending_start = seg_global_start
-                else:
-                    pending_k = torch.cat([pending_k, fast_k_seg], dim=1)
-                    pending_v = torch.cat([pending_v, fast_v_seg], dim=1)
-                    pending_lr0 = torch.cat([pending_lr0, lr0_seg], dim=1)
-                    pending_lr1 = torch.cat([pending_lr1, lr1_seg], dim=1)
-                    pending_lr2 = torch.cat([pending_lr2, lr2_seg], dim=1)
-                    if pending_momentum is not None and momentum_seg is not None:
-                        pending_momentum = torch.cat(
-                            [pending_momentum, momentum_seg], dim=1
-                        )
-
-                while (
-                    pending_k is not None and pending_k.shape[1] >= self.lact_chunk_size
-                ):
-                    if pending_start is None:
-                        raise RuntimeError("pending_start missing for LaCT update.")
-                    if pending_start >= update_cutoff:
-                        break
-                    ki = pending_k[:, : self.lact_chunk_size, :]
-                    vi = pending_v[:, : self.lact_chunk_size, :]
-                    lr0i = pending_lr0[:, : self.lact_chunk_size, :]
-                    lr1i = pending_lr1[:, : self.lact_chunk_size, :]
-                    lr2i = pending_lr2[:, : self.lact_chunk_size, :]
-                    mi = (
-                        pending_momentum[:, : self.lact_chunk_size, :]
-                        if pending_momentum is not None
-                        else None
-                    )
-
-                    (
-                        fw_w0,
-                        fw_w1,
-                        fw_w2,
-                        dw0_momentum,
-                        dw1_momentum,
-                        dw2_momentum,
-                    ) = self._update_fast_weights(
-                        fw_w0,
-                        fw_w1,
-                        fw_w2,
-                        w0_norm,
-                        w1_norm,
-                        w2_norm,
-                        dw0_momentum,
-                        dw1_momentum,
-                        dw2_momentum,
-                        ki,
-                        vi,
-                        lr0i,
-                        lr1i,
-                        lr2i,
-                        mi,
-                    )
-
-                    if pending_k.shape[1] > self.lact_chunk_size:
-                        pending_k = pending_k[:, self.lact_chunk_size :, :]
-                        pending_v = pending_v[:, self.lact_chunk_size :, :]
-                        pending_lr0 = pending_lr0[:, self.lact_chunk_size :, :]
-                        pending_lr1 = pending_lr1[:, self.lact_chunk_size :, :]
-                        pending_lr2 = pending_lr2[:, self.lact_chunk_size :, :]
-                        if pending_momentum is not None:
-                            pending_momentum = pending_momentum[
-                                :, self.lact_chunk_size :, :
-                            ]
-                        pending_start += self.lact_chunk_size
-                    else:
-                        pending_k = None
-                        pending_v = None
-                        pending_lr0 = None
-                        pending_lr1 = None
-                        pending_lr2 = None
-                        pending_momentum = None
-                        pending_start = None
-
-                cursor += step
-
-            ttt_output[:, chunk_start:chunk_end, :] = ttt_chunk
-
-        for chunk_start, chunk_end in attn_chunks:
-            hs_chunk = hidden_states[:, chunk_start:chunk_end, :]
-            cos = cos_full[:, chunk_start:chunk_end, :]
-            sin = sin_full[:, chunk_start:chunk_end, :]
-
-            q_normed, k_normed, v, _, _, _ = self._compute_qkv(hs_chunk)
+        def run_attention_chunk(
+            chunk_start: int,
+            chunk_end: int,
+            hs_chunk: torch.Tensor,
+            cos: torch.Tensor,
+            sin: torch.Tensor,
+            q_normed: torch.Tensor,
+            k_normed: torch.Tensor,
+            v: torch.Tensor,
+        ) -> torch.Tensor:
+            nonlocal local_key_states, local_value_states
 
             query_states = q_normed.transpose(1, 2)
             key_states = k_normed.transpose(1, 2)
@@ -679,20 +638,14 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
                 query_states, key_states, cos, sin, unsqueeze_dim=1
             )
 
-            if past_key_values is not None:
-                cache_position_chunk = torch.arange(
-                    chunk_start,
-                    chunk_end,
-                    device=hidden_states.device,
-                )
-                cache_kwargs = {
-                    "sin": sin,
-                    "cos": cos,
-                    "cache_position": cache_position_chunk,
-                }
-                key_states, value_states = past_key_values.update(
-                    key_states, value_states, self.layer_idx, cache_kwargs
-                )
+            if local_key_states is None:
+                local_key_states = key_states
+                local_value_states = value_states
+            else:
+                local_key_states = torch.cat([local_key_states, key_states], dim=2)
+                local_value_states = torch.cat([local_value_states, value_states], dim=2)
+            key_states = local_key_states
+            value_states = local_value_states
 
             if attention_mask is None:
                 cu_seqlens_q = torch.tensor(
@@ -755,32 +708,221 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
                     **attn_kwargs,
                 )
 
-            if past_key_values is not None and use_varlen_attn:
-                cache_len = key_states.shape[2]
-                if cache_len > self.window_size:
-                    key_states = key_states[:, :, -self.window_size :, :]
-                    value_states = value_states[:, :, -self.window_size :, :]
-                    past_key_values.layers[self.layer_idx].keys = key_states
-                    past_key_values.layers[self.layer_idx].values = value_states
+            if (
+                past_key_values is not None
+                and use_varlen_attn
+                and local_key_states.shape[2] > self.window_size
+            ):
+                local_key_states = local_key_states[:, :, -self.window_size :, :]
+                local_value_states = local_value_states[:, :, -self.window_size :, :]
 
-            attn_chunk = attn_output.reshape(batch_size, chunk_end - chunk_start, -1)
-            combined = attn_chunk + ttt_output[:, chunk_start:chunk_end, :]
-            output[:, chunk_start:chunk_end, :] = self.attn_layer.o_proj(combined)
+            return attn_output.reshape(batch_size, chunk_end - chunk_start, -1)
 
-        tail_start = max(seq_len - self.lact_chunk_size, 0)
-        tail_hidden = hidden_states[:, tail_start:seq_len, :]
-        tail_lr = self.lr_proj(tail_hidden)
-        if self.lr_parameterization == "mamba":
-            tail_lr = F.softplus(tail_lr.float() + self.base_lr_inv)
-        tail_fw_lr = rearrange(tail_lr, "b s (h d) -> (b h) s d", h=self.num_fw_heads)
-        tail_lr0, tail_lr1, tail_lr2 = tail_fw_lr.chunk(3, dim=-1)
-        if self.use_momentum:
-            tail_momentum = self.momentum_proj(tail_hidden).float()
-            tail_momentum = rearrange(
-                tail_momentum, "b s (h d) -> (b h) s d", h=self.num_fw_heads
+        for chunk_start, chunk_end in ttt_chunks:
+            hs_chunk = hidden_states[:, chunk_start:chunk_end, :]
+            cos = cos_full[:, chunk_start:chunk_end, :]
+            sin = sin_full[:, chunk_start:chunk_end, :]
+
+            q_normed = q_normed_full[:, chunk_start:chunk_end, :, :]
+            k_normed = k_normed_full[:, chunk_start:chunk_end, :, :]
+            v = v_full[:, chunk_start:chunk_end, :]
+            q_flat = q_flat_full[:, chunk_start:chunk_end, :]
+            k_flat = k_flat_full[:, chunk_start:chunk_end, :]
+            v_expanded = v_expanded_full[:, chunk_start:chunk_end, :]
+
+            fast_q, fast_k, fast_v = self._prepare_fast_qkv(
+                q_flat, k_flat, v_expanded, cos, sin
             )
-        else:
-            tail_momentum = None
+
+            fw_lr1 = fw_lr1_full[:, chunk_start:chunk_end, :]
+            fw_lr2 = fw_lr2_full[:, chunk_start:chunk_end, :]
+            fw_lr3 = fw_lr3_full[:, chunk_start:chunk_end, :]
+            momentum = (
+                momentum_full[:, chunk_start:chunk_end, :]
+                if momentum_full is not None
+                else None
+            )
+
+            ttt_chunk = torch.empty_like(hs_chunk)
+            cursor = 0
+            while cursor < fast_q.shape[1]:
+                pending_len = 0 if pending_k is None else pending_k.shape[1]
+                step = min(
+                    self.lact_chunk_size - pending_len,
+                    fast_q.shape[1] - cursor,
+                )
+                if step <= 0:
+                    raise RuntimeError(
+                        "LaCT streaming chunked hit non-positive step; "
+                        f"pending_len={pending_len}, cursor={cursor}, "
+                        f"seq_len={seq_len}, update_cutoff={update_cutoff}."
+                    )
+                seg_global_start = chunk_start + cursor
+
+                fast_q_seg = fast_q[:, cursor : cursor + step, :]
+                fast_k_seg = fast_k[:, cursor : cursor + step, :]
+                fast_v_seg = fast_v[:, cursor : cursor + step, :]
+                lr0_seg = fw_lr1[:, cursor : cursor + step, :]
+                lr1_seg = fw_lr2[:, cursor : cursor + step, :]
+                lr2_seg = fw_lr3[:, cursor : cursor + step, :]
+                momentum_seg = (
+                    momentum[:, cursor : cursor + step, :]
+                    if momentum is not None
+                    else None
+                )
+
+                fw_x = self._ttt_forward_chunk(fw_w0, fw_w1, fw_w2, fast_q_seg)
+
+                ttt_x_normed = self.ttt_norm(fw_x)
+                if ttt_scale_full is not None:
+                    ttt_scale = ttt_scale_full[
+                        :, seg_global_start : seg_global_start + step, :
+                    ]
+                    ttt_x_normed = ttt_x_normed * ttt_scale
+
+                ttt_seg = rearrange(
+                    ttt_x_normed,
+                    "(b n) s d -> b s (n d)",
+                    n=self.num_fw_heads,
+                    b=batch_size,
+                )
+                ttt_chunk[:, cursor : cursor + step, :] = ttt_seg.type_as(hidden_states)
+
+                if self.fp32_states:
+                    fast_k_seg = fast_k_seg.float()
+                    fast_v_seg = fast_v_seg.float()
+
+                if pending_k is None:
+                    pending_k = fast_k_seg
+                    pending_v = fast_v_seg
+                    pending_lr0 = lr0_seg
+                    pending_lr1 = lr1_seg
+                    pending_lr2 = lr2_seg
+                    pending_momentum = momentum_seg
+                    pending_start = seg_global_start
+                else:
+                    pending_k = torch.cat([pending_k, fast_k_seg], dim=1)
+                    pending_v = torch.cat([pending_v, fast_v_seg], dim=1)
+                    pending_lr0 = torch.cat([pending_lr0, lr0_seg], dim=1)
+                    pending_lr1 = torch.cat([pending_lr1, lr1_seg], dim=1)
+                    pending_lr2 = torch.cat([pending_lr2, lr2_seg], dim=1)
+                    if pending_momentum is not None and momentum_seg is not None:
+                        pending_momentum = torch.cat(
+                            [pending_momentum, momentum_seg], dim=1
+                        )
+
+                while (
+                    pending_k is not None and pending_k.shape[1] >= self.lact_chunk_size
+                ):
+                    if pending_start is None:
+                        raise RuntimeError("pending_start missing for LaCT update.")
+                    if pending_start >= update_cutoff:
+                        break
+                    ki = pending_k[:, : self.lact_chunk_size, :]
+                    vi = pending_v[:, : self.lact_chunk_size, :]
+                    lr0i = pending_lr0[:, : self.lact_chunk_size, :]
+                    lr1i = pending_lr1[:, : self.lact_chunk_size, :]
+                    lr2i = pending_lr2[:, : self.lact_chunk_size, :]
+                    mi = (
+                        pending_momentum[:, : self.lact_chunk_size, :]
+                        if pending_momentum is not None
+                        else None
+                    )
+
+                    update_fn = (
+                        self._update_fast_weights_fused
+                        if self.use_fused_kernel
+                        else self._update_fast_weights
+                    )
+                    (
+                        fw_w0,
+                        fw_w1,
+                        fw_w2,
+                        dw0_momentum,
+                        dw1_momentum,
+                        dw2_momentum,
+                    ) = update_fn(
+                        fw_w0,
+                        fw_w1,
+                        fw_w2,
+                        w0_norm,
+                        w1_norm,
+                        w2_norm,
+                        dw0_momentum,
+                        dw1_momentum,
+                        dw2_momentum,
+                        ki,
+                        vi,
+                        lr0i,
+                        lr1i,
+                        lr2i,
+                        mi,
+                    )
+
+                    if pending_k.shape[1] > self.lact_chunk_size:
+                        pending_k = pending_k[:, self.lact_chunk_size :, :]
+                        pending_v = pending_v[:, self.lact_chunk_size :, :]
+                        pending_lr0 = pending_lr0[:, self.lact_chunk_size :, :]
+                        pending_lr1 = pending_lr1[:, self.lact_chunk_size :, :]
+                        pending_lr2 = pending_lr2[:, self.lact_chunk_size :, :]
+                        if pending_momentum is not None:
+                            pending_momentum = pending_momentum[
+                                :, self.lact_chunk_size :, :
+                            ]
+                        pending_start += self.lact_chunk_size
+                    else:
+                        pending_k = None
+                        pending_v = None
+                        pending_lr0 = None
+                        pending_lr1 = None
+                        pending_lr2 = None
+                        pending_momentum = None
+                        pending_start = None
+
+                cursor += step
+
+            if ttt_output is not None:
+                ttt_output[:, chunk_start:chunk_end, :] = ttt_chunk
+
+            if inline_attention:
+                attn_chunk = run_attention_chunk(
+                    chunk_start,
+                    chunk_end,
+                    hs_chunk,
+                    cos,
+                    sin,
+                    q_normed,
+                    k_normed,
+                    v,
+                )
+                combined_chunk = combined_output[:, chunk_start:chunk_end, :]
+                combined_chunk.copy_(attn_chunk)
+                combined_chunk.add_(ttt_chunk)
+
+        if not inline_attention:
+            assert ttt_output is not None
+            for chunk_start, chunk_end in attn_chunks:
+                hs_chunk = hidden_states[:, chunk_start:chunk_end, :]
+                cos = cos_full[:, chunk_start:chunk_end, :]
+                sin = sin_full[:, chunk_start:chunk_end, :]
+
+                q_normed = q_normed_full[:, chunk_start:chunk_end, :, :]
+                k_normed = k_normed_full[:, chunk_start:chunk_end, :, :]
+                v = v_full[:, chunk_start:chunk_end, :]
+
+                attn_chunk = run_attention_chunk(
+                    chunk_start,
+                    chunk_end,
+                    hs_chunk,
+                    cos,
+                    sin,
+                    q_normed,
+                    k_normed,
+                    v,
+                )
+                combined_chunk = combined_output[:, chunk_start:chunk_end, :]
+                combined_chunk.copy_(attn_chunk)
+                combined_chunk.add_(ttt_output[:, chunk_start:chunk_end, :])
 
         state = LaCTLayerState(
             w0=fw_w0,
@@ -792,22 +934,26 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
             dw0_momentum=dw0_momentum,
             dw1_momentum=dw1_momentum,
             dw2_momentum=dw2_momentum,
-            pending_k=tail_k,
-            pending_v=tail_v,
-            pending_lr0=tail_lr0,
-            pending_lr1=tail_lr1,
-            pending_lr2=tail_lr2,
-            pending_momentum=tail_momentum,
+            pending_k=pending_k,
+            pending_v=pending_v,
+            pending_lr0=pending_lr0,
+            pending_lr1=pending_lr1,
+            pending_lr2=pending_lr2,
+            pending_momentum=pending_momentum,
         )
         lact_cache.set_layer_state(self.layer_idx, state)
 
-        if past_key_values is not None and not use_varlen_attn:
-            cache = past_key_values.layers[self.layer_idx]
-            cache_len = cache.keys.shape[2]
-            if cache_len > self.window_size:
-                cache.keys = cache.keys[:, :, -self.window_size :, :]
-                cache.values = cache.values[:, :, -self.window_size :, :]
+        if past_key_values is not None and local_key_states is not None:
+            if local_key_states.shape[2] > self.window_size:
+                local_key_states = local_key_states[:, :, -self.window_size :, :]
+                local_value_states = local_value_states[:, :, -self.window_size :, :]
+            _set_kv_cache_layer(
+                past_key_values, self.layer_idx, local_key_states, local_value_states
+            )
+            if self.layer_idx == 0 and cache_seen_tokens is not None:
+                past_key_values._seen_tokens = cache_seen_tokens + seq_len
 
+        output = self.attn_layer.o_proj(combined_output)
         return output, None
 
     def forward(
@@ -846,4 +992,3 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
             lact_cache=lact_cache,
             **kwargs,
         )
-

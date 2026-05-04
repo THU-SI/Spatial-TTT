@@ -5,14 +5,21 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from safetensors import safe_open
-from transformers import Qwen3VLForConditionalGeneration
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+from transformers import AutoConfig, Qwen3VLForConditionalGeneration
 from transformers.cache_utils import DynamicCache
 
 from .causal_swa_lact import LaCTCache, Qwen3VLLaCTSWIGLULayer
 from .causal_swa_lact_streaming_chunked import (
     Qwen3VLLaCTSWIGLULayerStreamingChunked,
 )
+
+
+def _resolve_safetensors(checkpoint_path: str) -> Path:
+    p = Path(checkpoint_path)
+    if p.is_dir():
+        p = p / "model.safetensors"
+    return p
 
 
 def wrap_model_with_lact(
@@ -343,18 +350,19 @@ def load_spatial_ttt_model(
     window_size: int = 2560,
     lact_layers: Optional[str] = None,
     torch_dtype: torch.dtype = torch.bfloat16,
-    device: Optional[str] = None,
-    checkpoint_path: Optional[str] = None,
+    device: str = "cuda",
+    checkpoint_path: str = "",
     **kwargs,
 ) -> SpatialTTTForConditionalGeneration:
-    # load base model
-    model = Qwen3VLForConditionalGeneration.from_pretrained(
+    # init model on meta device
+    config = AutoConfig.from_pretrained(
         model_path,
         torch_dtype=torch_dtype,
         attn_implementation="flash_attention_2",
         **kwargs,
     )
-
+    with init_empty_weights():
+        model = Qwen3VLForConditionalGeneration(config)
     model = wrap_model_with_lact(
         model,
         num_lact_heads=num_lact_heads,
@@ -366,39 +374,14 @@ def load_spatial_ttt_model(
         lact_layers=lact_layers,
     )
 
-    # Load trained checkpoint if provided
-    if checkpoint_path is not None:
-        checkpoint_path = Path(checkpoint_path)
-        if checkpoint_path.is_dir():
-            # Look for model.safetensors in the directory
-            safetensors_path = checkpoint_path / "model.safetensors"
-            if not safetensors_path.exists():
-                raise FileNotFoundError(
-                    f"model.safetensors not found in {checkpoint_path}"
-                )
-        else:
-            safetensors_path = checkpoint_path
-
-        print(f"Loading checkpoint from {safetensors_path}...")
-        state_dict = {}
-        with safe_open(safetensors_path, framework="pt", device="cpu") as f:
-            for key in f.keys():
-                state_dict[key] = f.get_tensor(key)
-
-        # Load state dict
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if missing:
-            print(f"Missing keys: {missing}")
-        if unexpected:
-            print(f"Unexpected keys: {unexpected}")
-        print(f"Loaded {len(state_dict)} parameters from checkpoint")
-
-    if device is not None:
-        # model = model.to(device)
-        model = model.to("cuda")
-
-    # convert to inference wrapper
+    safetensors_path = _resolve_safetensors(checkpoint_path)
+    print(f"Loading checkpoint: {safetensors_path} → {device}")
+    load_checkpoint_and_dispatch(
+        model,
+        safetensors_path,
+        device_map={"": device},
+        dtype=torch_dtype,
+    )
     spatial_ttt_model = SpatialTTTForConditionalGeneration(model)
 
     return spatial_ttt_model
-

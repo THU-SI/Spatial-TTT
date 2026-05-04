@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from flash_attn.flash_attn_interface import flash_attn_varlen_func
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from .ttt_operation import (
@@ -19,22 +20,10 @@ from .ttt_operation import (
     zeropower_via_newtonschulz5,
 )
 
-try:
-    from flash_attn.flash_attn_interface import flash_attn_varlen_func
-
-    FLASH_ATTN_AVAILABLE = True
-except ImportError:
-    flash_attn_varlen_func = None
-    FLASH_ATTN_AVAILABLE = False
-
-try:
-    from .ttt_operation_fused_kernel import (
-        postnorm_block_causal_lact_swiglu_fused_kernel_triton,
-        prenorm_block_causal_lact_swiglu_fused_kernel_triton,
-    )
-except ImportError:
-    postnorm_block_causal_lact_swiglu_fused_kernel_triton = None
-    prenorm_block_causal_lact_swiglu_fused_kernel_triton = None
+from .ttt_operation_fused_kernel import (
+    postnorm_block_causal_lact_swiglu_fused_kernel_triton,
+    prenorm_block_causal_lact_swiglu_fused_kernel_triton,
+)
 
 
 def _find_video_segments(mask):
@@ -149,6 +138,64 @@ class LaCTCache:
 
     def reset(self):
         self._layer_states.clear()
+
+
+def _get_kv_cache_layer(past_key_values, layer_idx: int):
+    if past_key_values is None:
+        return None, None
+
+    if hasattr(past_key_values, "layers"):
+        layers = past_key_values.layers
+        if layer_idx >= len(layers):
+            return None, None
+        layer = layers[layer_idx]
+        return getattr(layer, "keys", None), getattr(layer, "values", None)
+
+    key_cache = getattr(past_key_values, "key_cache", None)
+    value_cache = getattr(past_key_values, "value_cache", None)
+    if key_cache is None or value_cache is None or layer_idx >= len(key_cache):
+        return None, None
+    return key_cache[layer_idx], value_cache[layer_idx]
+
+
+def _set_kv_cache_layer(past_key_values, layer_idx: int, key_states, value_states):
+    if past_key_values is None:
+        return
+
+    if hasattr(past_key_values, "layers"):
+        layer = past_key_values.layers[layer_idx]
+        layer.keys = key_states
+        layer.values = value_states
+        return
+
+    key_cache = getattr(past_key_values, "key_cache", None)
+    value_cache = getattr(past_key_values, "value_cache", None)
+    if key_cache is not None and value_cache is not None:
+        while len(key_cache) < layer_idx:
+            key_cache.append(torch.tensor([]))
+            value_cache.append(torch.tensor([]))
+        if len(key_cache) == layer_idx:
+            key_cache.append(key_states)
+            value_cache.append(value_states)
+        else:
+            key_cache[layer_idx] = key_states
+            value_cache[layer_idx] = value_states
+
+
+def _truncate_kv_cache_layer(
+    past_key_values,
+    layer_idx: int,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    window_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if key_states.shape[2] <= window_size:
+        return key_states, value_states
+
+    key_states = key_states[:, :, -window_size:, :]
+    value_states = value_states[:, :, -window_size:, :]
+    _set_kv_cache_layer(past_key_values, layer_idx, key_states, value_states)
+    return key_states, value_states
 
 
 class LowRankFastWeight(nn.Module):
@@ -384,10 +431,7 @@ class Qwen3VLLaCTSWIGLULayer(nn.Module):
         momentum: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.ttt_prenorm:
-            if (
-                self.use_fused_kernel
-                and prenorm_block_causal_lact_swiglu_fused_kernel_triton is not None
-            ):
+            if self.use_fused_kernel:
                 return prenorm_block_causal_lact_swiglu_fused_kernel_triton(
                     fw_w0,
                     fw_w1,
@@ -402,26 +446,22 @@ class Qwen3VLLaCTSWIGLULayer(nn.Module):
                     use_muon=self.use_muon,
                     momentum=momentum,
                 )
-            else:
-                return prenorm_block_causal_lact_swiglu(
-                    fw_w0,
-                    fw_w1,
-                    fw_w2,
-                    fast_q,
-                    fast_k,
-                    fast_v,
-                    fw_lr1,
-                    fw_lr2,
-                    fw_lr3,
-                    chunk_size=self.lact_chunk_size,
-                    use_muon=self.use_muon,
-                    momentum=momentum,
-                )
+            return prenorm_block_causal_lact_swiglu(
+                fw_w0,
+                fw_w1,
+                fw_w2,
+                fast_q,
+                fast_k,
+                fast_v,
+                fw_lr1,
+                fw_lr2,
+                fw_lr3,
+                chunk_size=self.lact_chunk_size,
+                use_muon=self.use_muon,
+                momentum=momentum,
+            )
         else:
-            if (
-                self.use_fused_kernel
-                and postnorm_block_causal_lact_swiglu_fused_kernel_triton is not None
-            ):
+            if self.use_fused_kernel:
                 return postnorm_block_causal_lact_swiglu_fused_kernel_triton(
                     fw_w0,
                     fw_w1,
@@ -436,21 +476,20 @@ class Qwen3VLLaCTSWIGLULayer(nn.Module):
                     use_muon=self.use_muon,
                     momentum=momentum,
                 )
-            else:
-                return block_causal_lact_swiglu(
-                    fw_w0,
-                    fw_w1,
-                    fw_w2,
-                    fast_q,
-                    fast_k,
-                    fast_v,
-                    fw_lr1,
-                    fw_lr2,
-                    fw_lr3,
-                    chunk_size=self.lact_chunk_size,
-                    use_muon=self.use_muon,
-                    momentum=momentum,
-                )
+            return block_causal_lact_swiglu(
+                fw_w0,
+                fw_w1,
+                fw_w2,
+                fast_q,
+                fast_k,
+                fast_v,
+                fw_lr1,
+                fw_lr2,
+                fw_lr3,
+                chunk_size=self.lact_chunk_size,
+                use_muon=self.use_muon,
+                momentum=momentum,
+            )
 
     def _compute_ttt_output(
         self,
@@ -1086,15 +1125,15 @@ class Qwen3VLLaCTSWIGLULayer(nn.Module):
             if seq_len == 1:
                 cache_len = key_states.shape[2]
                 if cache_len > self.window_size:
-                    key_states = key_states[:, :, -self.window_size :, :]
-                    value_states = value_states[:, :, -self.window_size :, :]
-                    past_key_values.layers[self.layer_idx].keys = key_states
-                    past_key_values.layers[self.layer_idx].values = value_states
+                    key_states, value_states = _truncate_kv_cache_layer(
+                        past_key_values,
+                        self.layer_idx,
+                        key_states,
+                        value_states,
+                        self.window_size,
+                    )
 
-        use_varlen_attn = (
-            FLASH_ATTN_AVAILABLE
-            and self.config._attn_implementation == "flash_attention_2"
-        )
+        use_varlen_attn = self.config._attn_implementation == "flash_attention_2"
 
         if attention_mask is None:
             cu_seqlens_q = torch.tensor(
@@ -1167,14 +1206,16 @@ class Qwen3VLLaCTSWIGLULayer(nn.Module):
             # double check for prefill stage
             cache_len = key_states.shape[2]
             if cache_len > self.window_size:
-                key_states = key_states[:, :, -self.window_size :, :]
-                value_states = value_states[:, :, -self.window_size :, :]
-                past_key_values.layers[self.layer_idx].keys = key_states
-                past_key_values.layers[self.layer_idx].values = value_states
+                key_states, value_states = _truncate_kv_cache_layer(
+                    past_key_values,
+                    self.layer_idx,
+                    key_states,
+                    value_states,
+                    self.window_size,
+                )
 
         attn_output = attn_output.reshape(batch_size, seq_len, -1).contiguous()
         output = attn_output + ttt_output
         output = self.attn_layer.o_proj(output)
 
         return output, attn_weights
-
