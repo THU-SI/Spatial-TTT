@@ -30,6 +30,7 @@ from .ttt_operation_fused_kernel import (
 )
 from .lact_triton_kernels.lact_prepare_qk import fused_prepare_qk
 from .lact_triton_kernels.rmsnorm_scale import fused_rmsnorm_scale_rearrange
+from .lact_triton_kernels.flat_qkv import fused_flat_qkv
 
 
 @dataclass
@@ -70,21 +71,37 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
         k_normed = self.attn_layer.k_norm(
             rearrange(k, "... (h d) -> ... h d", d=self.head_dim)
         )
-        q_flat = rearrange(q_normed, "... h d -> ... (h d)")
-        k_flat = rearrange(k_normed, "... h d -> ... (h d)")
 
-        n_rep = self.num_attn_heads // self.num_kv_heads
-        if n_rep > 1:
-            k_flat = k_flat.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-            k_flat = k_flat.unsqueeze(3).expand(-1, -1, -1, n_rep, -1)
-            k_flat = k_flat.reshape(batch_size, seq_len, -1)
-            v_expanded = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-            v_expanded = v_expanded.unsqueeze(3).expand(-1, -1, -1, n_rep, -1)
-            v_expanded = v_expanded.reshape(batch_size, seq_len, -1)
+        if self.use_fused_kernel and q_normed.is_cuda and batch_size == 1:
+            q_flat, k_flat, v_expanded = fused_flat_qkv(
+                q_normed,
+                k_normed,
+                v,
+                self.q_scale,
+                self.q_offset,
+                self.k_scale,
+                self.k_offset,
+            )
         else:
-            v_expanded = v
+            q_flat = rearrange(q_normed, "... h d -> ... (h d)")
+            k_flat = rearrange(k_normed, "... h d -> ... (h d)")
 
-        q_flat, k_flat = self._rescale_qk(q_flat, k_flat)
+            n_rep = self.num_attn_heads // self.num_kv_heads
+            if n_rep > 1:
+                k_flat = k_flat.view(
+                    batch_size, seq_len, self.num_kv_heads, self.head_dim
+                )
+                k_flat = k_flat.unsqueeze(3).expand(-1, -1, -1, n_rep, -1)
+                k_flat = k_flat.reshape(batch_size, seq_len, -1)
+                v_expanded = v.view(
+                    batch_size, seq_len, self.num_kv_heads, self.head_dim
+                )
+                v_expanded = v_expanded.unsqueeze(3).expand(-1, -1, -1, n_rep, -1)
+                v_expanded = v_expanded.reshape(batch_size, seq_len, -1)
+            else:
+                v_expanded = v
+
+            q_flat, k_flat = self._rescale_qk(q_flat, k_flat)
         return q_normed, k_normed, v, q_flat, k_flat, v_expanded
 
     def _prepare_fast_qkv(
