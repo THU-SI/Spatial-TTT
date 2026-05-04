@@ -81,7 +81,7 @@ def fused_flat_qkv(
     k_out = torch.empty(out_shape, device=k_normed.device, dtype=k_normed.dtype)
     v_out = torch.empty(out_shape, device=v.device, dtype=v.dtype)
     block_m = 16
-    block_c = 256
+    block_c = 512
     _flat_qkv_kernel[(triton.cdiv(seq_len, block_m), triton.cdiv(hidden, block_c))](
         q_normed,
         k_normed,
