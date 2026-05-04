@@ -484,6 +484,8 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
         lr1: torch.Tensor,
         lr2: torch.Tensor,
         momentum: Optional[torch.Tensor],
+        w0_w2_bf16: Optional[torch.Tensor] = None,
+        w1_bf16: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -492,10 +494,15 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
         Optional[torch.Tensor],
         Optional[torch.Tensor],
     ]:
-        w0_w2 = torch.cat([fw_w0, fw_w2], dim=1).contiguous()
+        if w0_w2_bf16 is None:
+            w0_w2_bf16 = torch.cat([fw_w0, fw_w2], dim=1).to(
+                torch.bfloat16
+            ).contiguous()
+        if w1_bf16 is None:
+            w1_bf16 = fw_w1.to(torch.bfloat16).contiguous()
         dw0_dw2, dw1 = fused_lact_swiglu_ffn_fast_weight_grads(
-            w0_w2.to(torch.bfloat16).contiguous(),
-            fw_w1.to(torch.bfloat16).contiguous(),
+            w0_w2_bf16,
+            w1_bf16,
             fast_k.to(torch.bfloat16).contiguous(),
             fast_v.to(torch.bfloat16).contiguous(),
             lr0.squeeze(-1).contiguous(),
@@ -530,12 +537,19 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
         fw_w1: torch.Tensor,
         fw_w2: torch.Tensor,
         fast_q: torch.Tensor,
+        w0_w2_bf16: Optional[torch.Tensor] = None,
+        w1_bf16: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_fused_kernel:
-            w0_w2 = torch.cat([fw_w0, fw_w2], dim=1).contiguous()
+            if w0_w2_bf16 is None:
+                w0_w2_bf16 = torch.cat([fw_w0, fw_w2], dim=1).to(
+                    torch.bfloat16
+                ).contiguous()
+            if w1_bf16 is None:
+                w1_bf16 = fw_w1.to(torch.bfloat16).contiguous()
             return fused_swiglu_ffn_fwd(
-                w0_w2.to(torch.bfloat16).contiguous(),
-                fw_w1.to(torch.bfloat16).contiguous(),
+                w0_w2_bf16,
+                w1_bf16,
                 fast_q.to(torch.bfloat16).contiguous(),
             )
 
@@ -833,7 +847,22 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
                     else None
                 )
 
-                fw_x = self._ttt_forward_chunk(fw_w0, fw_w1, fw_w2, fast_q_seg)
+                w0_w2_bf16 = None
+                w1_bf16 = None
+                if self.use_fused_kernel:
+                    w0_w2_bf16 = torch.cat([fw_w0, fw_w2], dim=1).to(
+                        torch.bfloat16
+                    ).contiguous()
+                    w1_bf16 = fw_w1.to(torch.bfloat16).contiguous()
+
+                fw_x = self._ttt_forward_chunk(
+                    fw_w0,
+                    fw_w1,
+                    fw_w2,
+                    fast_q_seg,
+                    w0_w2_bf16,
+                    w1_bf16,
+                )
 
                 if (
                     self.use_fused_kernel
@@ -907,35 +936,58 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
                         else None
                     )
 
-                    update_fn = (
-                        self._update_fast_weights_fused
-                        if self.use_fused_kernel
-                        else self._update_fast_weights
-                    )
-                    (
-                        fw_w0,
-                        fw_w1,
-                        fw_w2,
-                        dw0_momentum,
-                        dw1_momentum,
-                        dw2_momentum,
-                    ) = update_fn(
-                        fw_w0,
-                        fw_w1,
-                        fw_w2,
-                        w0_norm,
-                        w1_norm,
-                        w2_norm,
-                        dw0_momentum,
-                        dw1_momentum,
-                        dw2_momentum,
-                        ki,
-                        vi,
-                        lr0i,
-                        lr1i,
-                        lr2i,
-                        mi,
-                    )
+                    if self.use_fused_kernel:
+                        (
+                            fw_w0,
+                            fw_w1,
+                            fw_w2,
+                            dw0_momentum,
+                            dw1_momentum,
+                            dw2_momentum,
+                        ) = self._update_fast_weights_fused(
+                            fw_w0,
+                            fw_w1,
+                            fw_w2,
+                            w0_norm,
+                            w1_norm,
+                            w2_norm,
+                            dw0_momentum,
+                            dw1_momentum,
+                            dw2_momentum,
+                            ki,
+                            vi,
+                            lr0i,
+                            lr1i,
+                            lr2i,
+                            mi,
+                            w0_w2_bf16,
+                            w1_bf16,
+                        )
+                    else:
+                        (
+                            fw_w0,
+                            fw_w1,
+                            fw_w2,
+                            dw0_momentum,
+                            dw1_momentum,
+                            dw2_momentum,
+                        ) = self._update_fast_weights(
+                            fw_w0,
+                            fw_w1,
+                            fw_w2,
+                            w0_norm,
+                            w1_norm,
+                            w2_norm,
+                            dw0_momentum,
+                            dw1_momentum,
+                            dw2_momentum,
+                            ki,
+                            vi,
+                            lr0i,
+                            lr1i,
+                            lr2i,
+                            mi,
+                        )
 
                     if pending_k.shape[1] > self.lact_chunk_size:
                         pending_k = pending_k[:, self.lact_chunk_size :, :]
