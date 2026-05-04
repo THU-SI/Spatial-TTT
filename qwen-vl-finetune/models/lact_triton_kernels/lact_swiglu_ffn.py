@@ -1,18 +1,10 @@
 import torch
 
-
-try:
-    from triton_swiglu_bwd_kernels import (
-        swiglu_backward_three_bmm_triton,
-        swiglu_backward_three_bmm_triton_op,
-    )
-    from triton_swiglu_kernels import fused_two_mm_swiglu_triton
-except ImportError:
-    from .triton_swiglu_bwd_kernels import (
-        swiglu_backward_three_bmm_triton,
-        swiglu_backward_three_bmm_triton_op,
-    )
-    from .triton_swiglu_kernels import fused_two_mm_swiglu_triton
+from .triton_swiglu_bwd_kernels import (
+    swiglu_backward_three_bmm_triton,
+    swiglu_backward_three_bmm_triton_op,
+)
+from .triton_swiglu_kernels import fused_two_mm_swiglu_triton
 from torch.autograd.function import once_differentiable
 
 
@@ -118,4 +110,3 @@ def reference_swiglu_ffn_fwd(W0_W2, W1, X):
 
 if __name__ == "__main__":
     pass
-

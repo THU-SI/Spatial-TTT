@@ -2,19 +2,14 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-try:
-    from .lact_triton_kernels.l2norm_triton_kernels import l2_norm_add_fused
-    from .lact_triton_kernels.lact_fw_grad import (
-        fused_lact_swiglu_ffn_fast_weight_grads,
-    )
-    from .lact_triton_kernels.lact_swiglu_ffn import fused_swiglu_ffn_fwd
-    from .lact_triton_kernels.triton_prenorm_update_with_momentum import (
-        fused_prenorm_update_with_momentum_and_l2_norm,
-    )
-except ImportError:
-    from lact_triton_kernels.l2norm_triton_kernels import l2_norm_add_fused
-    from lact_triton_kernels.lact_fw_grad import fused_lact_swiglu_ffn_fast_weight_grads
-    from lact_triton_kernels.lact_swiglu_ffn import fused_swiglu_ffn_fwd
+from .lact_triton_kernels.l2norm_triton_kernels import l2_norm_add_fused
+from .lact_triton_kernels.lact_fw_grad import (
+    fused_lact_swiglu_ffn_fast_weight_grads,
+)
+from .lact_triton_kernels.lact_swiglu_ffn import fused_swiglu_ffn_fwd
+from .lact_triton_kernels.triton_prenorm_update_with_momentum import (
+    fused_prenorm_update_with_momentum_and_l2_norm,
+)
 
 
 @torch.compile()
@@ -305,4 +300,3 @@ def prenorm_block_causal_lact_swiglu_fused_kernel_triton(
     output = rearrange(output, "n b c d -> b (n c) d")
 
     return output[:, :q_original_length]
-

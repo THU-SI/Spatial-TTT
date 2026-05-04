@@ -2,20 +2,9 @@ import torch
 
 from torch.autograd.function import once_differentiable
 
-try:
-    from triton_swiglu_bwd_with_lr import swiglu_backward_three_bmm_with_lr_triton
-
-    from triton_fused_matmul_kernels import (
-        fused_two_mm_same_out_interface,
-    )
-    from triton_pointwise_kernels import triton_swiglu_bwd_bwd_fused_cat_inp_out
-except ImportError:
-    from .triton_swiglu_bwd_with_lr import swiglu_backward_three_bmm_with_lr_triton
-
-    from .triton_fused_matmul_kernels import (
-        fused_two_mm_same_out_interface,
-    )
-    from .triton_pointwise_kernels import triton_swiglu_bwd_bwd_fused_cat_inp_out
+from .triton_swiglu_bwd_with_lr import swiglu_backward_three_bmm_with_lr_triton
+from .triton_fused_matmul_kernels import fused_two_mm_same_out_interface
+from .triton_pointwise_kernels import triton_swiglu_bwd_bwd_fused_cat_inp_out
 
 
 class FusedLactSwiGLUFFNBwd(torch.autograd.Function):
@@ -304,4 +293,3 @@ def reference_lact_swiglu_ffn_fast_weight_grads(W0_W2, W1, K, V, lr0, lr1, lr2):
     DW1 = torch.bmm(V.transpose(1, 2), Hidden_with_lr1.transpose(1, 2))
 
     return DW0_DW2, DW1
-
