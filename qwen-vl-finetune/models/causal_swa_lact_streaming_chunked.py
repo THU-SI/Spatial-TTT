@@ -7,6 +7,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+from flash_attn.flash_attn_interface import flash_attn_func
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 
 from .causal_swa_lact import (
@@ -705,38 +706,41 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
             key_states = local_key_states
             value_states = local_value_states
 
-            if attention_mask is None:
-                cu_seqlens_q = torch.tensor(
-                    [0, query_states.shape[2]],
-                    device=hidden_states.device,
-                    dtype=torch.int32,
-                )
-                cu_seqlens_k = torch.tensor(
-                    [0, key_states.shape[2]],
-                    device=hidden_states.device,
-                    dtype=torch.int32,
-                )
-            else:
+            if attention_mask is not None:
                 cu_seqlens_q = attention_mask
                 cu_seqlens_k = attention_mask
+            else:
+                cu_seqlens_q = None
+                cu_seqlens_k = None
 
             if use_varlen_attn:
-                query_fa = query_states.transpose(1, 2).squeeze(0)
-                key_fa = key_states.transpose(1, 2).squeeze(0)
-                value_fa = value_states.transpose(1, 2).squeeze(0)
-
-                attn_output = flash_attn_varlen_func(
-                    query_fa,
-                    key_fa,
-                    value_fa,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=cu_seqlens_k,
-                    max_seqlen_q=query_fa.shape[0],
-                    max_seqlen_k=key_fa.shape[0],
-                    window_size=(self.window_size - 1, 0),
-                    causal=True,
-                )
-                attn_output = attn_output.unsqueeze(0)
+                query_fa = query_states.transpose(1, 2)
+                key_fa = key_states.transpose(1, 2)
+                value_fa = value_states.transpose(1, 2)
+                if attention_mask is None:
+                    attn_output = flash_attn_func(
+                        query_fa,
+                        key_fa,
+                        value_fa,
+                        window_size=(self.window_size - 1, 0),
+                        causal=True,
+                    )
+                else:
+                    query_fa = query_fa.squeeze(0)
+                    key_fa = key_fa.squeeze(0)
+                    value_fa = value_fa.squeeze(0)
+                    attn_output = flash_attn_varlen_func(
+                        query_fa,
+                        key_fa,
+                        value_fa,
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_k=cu_seqlens_k,
+                        max_seqlen_q=query_fa.shape[0],
+                        max_seqlen_k=key_fa.shape[0],
+                        window_size=(self.window_size - 1, 0),
+                        causal=True,
+                    )
+                    attn_output = attn_output.unsqueeze(0)
             else:
                 attn_kwargs = dict(kwargs)
                 attn_kwargs["sliding_window"] = self.window_size
