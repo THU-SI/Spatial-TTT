@@ -39,6 +39,9 @@ class _VideoIndex:
     num_videos: int
     h: int
     w: int
+    video_token_start: int
+    video_token_end: int
+    video_tokens_contiguous: bool
 
 
 class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
@@ -172,6 +175,11 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
         frame_token_positions = video_token_positions.view(
             total_frames, tokens_per_frame
         )
+        video_token_start = int(video_token_positions[0].item())
+        video_token_end = int(video_token_positions[-1].item()) + 1
+        video_tokens_contiguous = (
+            video_token_end - video_token_start == num_video_tokens
+        )
         token_pos_to_frame = torch.full(
             (seq_len,),
             -1,
@@ -190,6 +198,9 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
             num_videos=num_videos,
             h=int(h),
             w=int(w),
+            video_token_start=video_token_start,
+            video_token_end=video_token_end,
+            video_tokens_contiguous=video_tokens_contiguous,
         )
 
     def _compute_frame_qkv(
@@ -220,7 +231,12 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
         video_mask: torch.Tensor,
         video_index: _VideoIndex,
     ) -> torch.Tensor:
-        video_tokens = x[video_mask]
+        if video_index.video_tokens_contiguous:
+            video_tokens = x[
+                0, video_index.video_token_start : video_index.video_token_end, :
+            ]
+        else:
+            video_tokens = x[video_mask]
         video_reshaped = rearrange(
             video_tokens,
             "(n t h w) c -> n c t h w",
@@ -230,7 +246,13 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
             w=video_index.w,
         )
         video_conv = conv_layer(video_reshaped)
-        x[video_mask] = rearrange(video_conv, "n c t h w -> (n t h w) c")
+        video_conv = rearrange(video_conv, "n c t h w -> (n t h w) c")
+        if video_index.video_tokens_contiguous:
+            x[0, video_index.video_token_start : video_index.video_token_end, :] = (
+                video_conv
+            )
+        else:
+            x[video_mask] = video_conv
         return x
 
     def _apply_streaming_conv(
