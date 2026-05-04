@@ -686,10 +686,8 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
                 )
 
                 q_t = fast_q_seg.transpose(1, 2)
-                v_t = fast_v_seg.transpose(1, 2)
                 if self.fp32_states:
                     q_t = q_t.float()
-                    v_t = v_t.float()
 
                 h = torch.bmm(fw_w2, q_t)
                 gate = F.silu(torch.bmm(fw_w0, q_t), inplace=True)
