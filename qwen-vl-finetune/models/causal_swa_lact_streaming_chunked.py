@@ -23,6 +23,11 @@ from .causal_swa_lact import (
     silu_backprop,
     zeropower_via_newtonschulz5,
 )
+from .ttt_operation_fused_kernel import (
+    fused_lact_swiglu_ffn_fast_weight_grads,
+    fused_swiglu_ffn_fwd,
+    l2_norm_add_fused,
+)
 
 
 @dataclass
@@ -401,6 +406,85 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
 
         return fw_w0, fw_w1, fw_w2, dw0_momentum, dw1_momentum, dw2_momentum
 
+    def _update_fast_weights_fused(
+        self,
+        fw_w0: torch.Tensor,
+        fw_w1: torch.Tensor,
+        fw_w2: torch.Tensor,
+        w0_norm: torch.Tensor,
+        w1_norm: torch.Tensor,
+        w2_norm: torch.Tensor,
+        dw0_momentum: Optional[torch.Tensor],
+        dw1_momentum: Optional[torch.Tensor],
+        dw2_momentum: Optional[torch.Tensor],
+        fast_k: torch.Tensor,
+        fast_v: torch.Tensor,
+        lr0: torch.Tensor,
+        lr1: torch.Tensor,
+        lr2: torch.Tensor,
+        momentum: Optional[torch.Tensor],
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        w0_w2 = torch.cat([fw_w0, fw_w2], dim=1).contiguous()
+        dw0_dw2, dw1 = fused_lact_swiglu_ffn_fast_weight_grads(
+            w0_w2.to(torch.bfloat16).contiguous(),
+            fw_w1.to(torch.bfloat16).contiguous(),
+            fast_k.to(torch.bfloat16).contiguous(),
+            fast_v.to(torch.bfloat16).contiguous(),
+            lr0.squeeze(-1).contiguous(),
+            lr1.squeeze(-1).contiguous(),
+            lr2.squeeze(-1).contiguous(),
+        )
+        dw0, dw2 = dw0_dw2.chunk(2, dim=1)
+
+        if momentum is not None and dw0_momentum is not None:
+            m_i = momentum.mean(dim=1, keepdim=True)
+            dw0 = dw0 + dw0_momentum * m_i
+            dw1 = dw1 + dw1_momentum * m_i
+            dw2 = dw2 + dw2_momentum * m_i
+            dw0_momentum = dw0
+            dw1_momentum = dw1
+            dw2_momentum = dw2
+
+        if self.use_muon:
+            dw0 = zeropower_via_newtonschulz5(dw0)
+            dw1 = zeropower_via_newtonschulz5(dw1)
+            dw2 = zeropower_via_newtonschulz5(dw2)
+
+        fw_w0 = l2_norm_add_fused(fw_w0, dw0, w0_norm, eps=1e-5, tgt_dtype=fw_w0.dtype)
+        fw_w1 = l2_norm_add_fused(fw_w1, dw1, w1_norm, eps=1e-5, tgt_dtype=fw_w1.dtype)
+        fw_w2 = l2_norm_add_fused(fw_w2, dw2, w2_norm, eps=1e-5, tgt_dtype=fw_w2.dtype)
+
+        return fw_w0, fw_w1, fw_w2, dw0_momentum, dw1_momentum, dw2_momentum
+
+    def _ttt_forward_chunk(
+        self,
+        fw_w0: torch.Tensor,
+        fw_w1: torch.Tensor,
+        fw_w2: torch.Tensor,
+        fast_q: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.use_fused_kernel:
+            w0_w2 = torch.cat([fw_w0, fw_w2], dim=1).contiguous()
+            return fused_swiglu_ffn_fwd(
+                w0_w2.to(torch.bfloat16).contiguous(),
+                fw_w1.to(torch.bfloat16).contiguous(),
+                fast_q.to(torch.bfloat16).contiguous(),
+            )
+
+        q_t = fast_q.transpose(1, 2)
+        if self.fp32_states:
+            q_t = q_t.float()
+        h = torch.bmm(fw_w2, q_t)
+        gate = F.silu(torch.bmm(fw_w0, q_t), inplace=True)
+        return torch.bmm(fw_w1, gate * h).transpose(1, 2)
+
     def _forward_prefill_streaming(
         self,
         hidden_states: torch.Tensor,
@@ -685,13 +769,7 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
                     else None
                 )
 
-                q_t = fast_q_seg.transpose(1, 2)
-                if self.fp32_states:
-                    q_t = q_t.float()
-
-                h = torch.bmm(fw_w2, q_t)
-                gate = F.silu(torch.bmm(fw_w0, q_t), inplace=True)
-                fw_x = torch.bmm(fw_w1, gate * h).transpose(1, 2)
+                fw_x = self._ttt_forward_chunk(fw_w0, fw_w1, fw_w2, fast_q_seg)
 
                 ttt_x_normed = self.ttt_norm(fw_x)
                 if ttt_scale_full is not None:
@@ -749,6 +827,11 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
                         else None
                     )
 
+                    update_fn = (
+                        self._update_fast_weights_fused
+                        if self.use_fused_kernel
+                        else self._update_fast_weights
+                    )
                     (
                         fw_w0,
                         fw_w1,
@@ -756,7 +839,7 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
                         dw0_momentum,
                         dw1_momentum,
                         dw2_momentum,
-                    ) = self._update_fast_weights(
+                    ) = update_fn(
                         fw_w0,
                         fw_w1,
                         fw_w2,
