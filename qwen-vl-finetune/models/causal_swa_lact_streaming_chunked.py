@@ -29,6 +29,7 @@ from .ttt_operation_fused_kernel import (
     l2_norm_add_fused,
 )
 from .lact_triton_kernels.lact_prepare_qk import fused_prepare_qk
+from .lact_triton_kernels.rmsnorm_scale import fused_rmsnorm_scale_rearrange
 
 
 @dataclass
@@ -813,20 +814,36 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
 
                 fw_x = self._ttt_forward_chunk(fw_w0, fw_w1, fw_w2, fast_q_seg)
 
-                ttt_x_normed = self.ttt_norm(fw_x)
-                if ttt_scale_full is not None:
+                if (
+                    self.use_fused_kernel
+                    and ttt_scale_full is not None
+                    and fw_x.is_cuda
+                ):
                     ttt_scale = ttt_scale_full[
                         :, seg_global_start : seg_global_start + step, :
                     ]
-                    ttt_x_normed = ttt_x_normed * ttt_scale
+                    ttt_seg = fused_rmsnorm_scale_rearrange(
+                        fw_x,
+                        self.ttt_norm.weight,
+                        ttt_scale.squeeze(-1).contiguous(),
+                        self.ttt_norm.eps,
+                    )
+                else:
+                    ttt_x_normed = self.ttt_norm(fw_x)
+                    if ttt_scale_full is not None:
+                        ttt_scale = ttt_scale_full[
+                            :, seg_global_start : seg_global_start + step, :
+                        ]
+                        ttt_x_normed = ttt_x_normed * ttt_scale
 
-                ttt_seg = rearrange(
-                    ttt_x_normed,
-                    "(b n) s d -> b s (n d)",
-                    n=self.num_fw_heads,
-                    b=batch_size,
-                )
-                ttt_chunk[:, cursor : cursor + step, :] = ttt_seg.type_as(hidden_states)
+                    ttt_seg = rearrange(
+                        ttt_x_normed,
+                        "(b n) s d -> b s (n d)",
+                        n=self.num_fw_heads,
+                        b=batch_size,
+                    )
+                    ttt_seg = ttt_seg.type_as(hidden_states)
+                ttt_chunk[:, cursor : cursor + step, :] = ttt_seg
 
                 if self.fp32_states and not self.use_fused_kernel:
                     fast_k_seg = fast_k_seg.float()
