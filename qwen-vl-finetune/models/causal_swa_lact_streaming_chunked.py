@@ -28,6 +28,7 @@ from .ttt_operation_fused_kernel import (
     fused_swiglu_ffn_fwd,
     l2_norm_add_fused,
 )
+from .lact_triton_kernels.lact_prepare_qk import fused_prepare_qk
 
 
 @dataclass
@@ -93,6 +94,25 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if (
+            self.use_fused_kernel
+            and self.qkv_silu
+            and not self.ttt_nope
+            and q_chunk.is_cuda
+            and q_chunk.shape[0] == 1
+            and q_chunk.shape[-1] == self.num_fw_heads * self.fw_head_dim
+            and cos.shape[-1] == self.head_dim
+        ):
+            fast_q, fast_k = fused_prepare_qk(
+                q_chunk, k_chunk, cos, sin, self.num_fw_heads
+            )
+            fast_v = rearrange(
+                v_chunk, "b s (h d) -> (b h) s d", h=self.num_fw_heads
+            )
+            if not self.no_v_silu:
+                fast_v = F.silu(fast_v)
+            return fast_q, fast_k, fast_v
+
         fast_q = rearrange(q_chunk, "b s (h d) -> (b h) s d", h=self.num_fw_heads)
         fast_k = rearrange(k_chunk, "b s (h d) -> (b h) s d", h=self.num_fw_heads)
         fast_v = rearrange(v_chunk, "b s (h d) -> (b h) s d", h=self.num_fw_heads)
