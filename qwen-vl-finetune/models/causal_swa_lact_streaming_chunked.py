@@ -808,7 +808,7 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
                 )
                 ttt_chunk[:, cursor : cursor + step, :] = ttt_seg.type_as(hidden_states)
 
-                if self.fp32_states:
+                if self.fp32_states and not self.use_fused_kernel:
                     fast_k_seg = fast_k_seg.float()
                     fast_v_seg = fast_v_seg.float()
 
@@ -943,6 +943,10 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
                 combined_chunk = combined_output[:, chunk_start:chunk_end, :]
                 combined_chunk.copy_(attn_chunk)
                 combined_chunk.add_(ttt_output[:, chunk_start:chunk_end, :])
+
+        if self.fp32_states and self.use_fused_kernel and pending_k is not None:
+            pending_k = pending_k.float()
+            pending_v = pending_v.float()
 
         state = LaCTLayerState(
             w0=fw_w0,
