@@ -142,7 +142,7 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
                 v_chunk, "b s (h d) -> (b h) s d", h=self.num_fw_heads
             )
             if not self.no_v_silu:
-                fast_v = F.silu(fast_v)
+                fast_v = F.silu(fast_v, inplace=not self.training)
             return fast_q, fast_k, fast_v
 
         fast_q = rearrange(q_chunk, "b s (h d) -> (b h) s d", h=self.num_fw_heads)
@@ -695,7 +695,9 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
             momentum_full = None
 
         if self.learnable_ttt_scale:
-            ttt_scale_full = F.silu(self.ttt_scale_proj(hidden_states), inplace=False)
+            ttt_scale_full = F.silu(
+                self.ttt_scale_proj(hidden_states), inplace=not self.training
+            )
             ttt_scale_full = rearrange(
                 ttt_scale_full,
                 "b s (n d) -> (b n) s d",
