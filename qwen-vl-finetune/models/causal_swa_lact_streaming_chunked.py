@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from flash_attn.flash_attn_interface import flash_attn_func
+from flash_attn.ops.triton.layer_norm import rms_norm_fn
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 
 from .causal_swa_lact import (
@@ -66,12 +67,24 @@ class Qwen3VLLaCTSWIGLULayerStreamingChunked(Qwen3VLLaCTSWIGLULayer):
         k = self.attn_layer.k_proj(hidden_states)
         v = self.attn_layer.v_proj(hidden_states)
 
-        q_normed = self.attn_layer.q_norm(
-            rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
-        )
-        k_normed = self.attn_layer.k_norm(
-            rearrange(k, "... (h d) -> ... h d", d=self.head_dim)
-        )
+        q_heads = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
+        k_heads = rearrange(k, "... (h d) -> ... h d", d=self.head_dim)
+        if self.use_fused_kernel and q.is_cuda and batch_size == 1:
+            q_normed = rms_norm_fn(
+                q_heads,
+                self.attn_layer.q_norm.weight,
+                None,
+                eps=self.attn_layer.q_norm.eps,
+            )
+            k_normed = rms_norm_fn(
+                k_heads,
+                self.attn_layer.k_norm.weight,
+                None,
+                eps=self.attn_layer.k_norm.eps,
+            )
+        else:
+            q_normed = self.attn_layer.q_norm(q_heads)
+            k_normed = self.attn_layer.k_norm(k_heads)
 
         if self.use_fused_kernel and q_normed.is_cuda and batch_size == 1:
             q_flat, k_flat, v_expanded = fused_flat_qkv(
