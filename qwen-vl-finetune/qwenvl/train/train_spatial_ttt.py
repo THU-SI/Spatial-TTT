@@ -43,9 +43,6 @@ from transformers.video_utils import group_videos_by_shape, reorder_videos
 transformers.logging.set_verbosity_error()
 
 # Import LaCT layer
-from models.causal_swa_lact import Qwen3VLLaCTSWIGLULayer
-from qwenvl.data.data_processor import make_supervised_data_module
-from qwenvl.train.argument import ModelArguments
 from trainer import replace_qwen2_vl_attention_class
 from transformers import (
     AutoProcessor,
@@ -55,6 +52,10 @@ from transformers import (
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModelOutputWithPast
 from transformers.utils import is_torchdynamo_compiling
 from transformers.video_utils import load_video
+
+from models.causal_swa_lact import Qwen3VLLaCTSWIGLULayer
+from qwenvl.data.data_processor import make_supervised_data_module
+from qwenvl.train.argument import ModelArguments
 
 TRAINING_ARGS_NAME = "training_args.bin"
 
@@ -1072,7 +1073,7 @@ def train(attn_implementation="flash_attention_2"):
     callbacks = []
     if lact_args.window_decay:
         window_decay_callback = WindowDecayCallback(
-            max_ws=5400, min_ws=2468, bias_step=50, base_step=3000
+            max_ws=5400, min_ws=lact_args.window_size, bias_step=50, base_step=3000
         )
         callbacks.append(window_decay_callback)
 
@@ -1086,9 +1087,7 @@ def train(attn_implementation="flash_attention_2"):
     type(trainer)._save = _save_func
 
     if lact_args.lact_enable and lact_args.lact_lr is not None:
-        trainer.create_optimizer = lambda: create_lact_optimizer(
-            trainer, lact_args
-        )
+        trainer.create_optimizer = lambda: create_lact_optimizer(trainer, lact_args)
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         logging.info("Checkpoint found, resuming training")
@@ -1106,4 +1105,3 @@ def train(attn_implementation="flash_attention_2"):
 
 if __name__ == "__main__":
     train(attn_implementation="flash_attention_2")
-
