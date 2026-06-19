@@ -23,7 +23,6 @@
 </p>
 
 <a href='https://arxiv.org/abs/2603.12255'><img src='https://img.shields.io/badge/arXiv-2603.12255-b31b1b.svg'></a> &nbsp;&nbsp;&nbsp;&nbsp;
-<a href='https://eccv2026.ecva.net/'><img src='https://img.shields.io/badge/ECCV-2026-🔥-orange'></a> &nbsp;&nbsp;&nbsp;&nbsp;
 <a href='https://liuff19.github.io/Spatial-TTT/'><img src='https://img.shields.io/badge/Project-Page-Green'></a> &nbsp;&nbsp;&nbsp;&nbsp;
 <a><img src='https://img.shields.io/badge/License-MIT-blue'></a> &nbsp;&nbsp;&nbsp;&nbsp;
 
