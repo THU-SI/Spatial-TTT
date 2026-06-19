@@ -2,6 +2,8 @@
 
 # ✨ Spatial-TTT: Streaming Visual-based Spatial Intelligence with Test-Time Training ✨
 
+<h3>🔥 ECCV 2026</h3>
+
 <p align="center">
     <a href="https://liuff19.github.io/">Fangfu Liu</a><sup>*,1</sup>,
     <a href="https://github.com/diankun-wu/">Diankun Wu</a><sup>*,1</sup>,
@@ -21,6 +23,7 @@
 </p>
 
 <a href='https://arxiv.org/abs/2603.12255'><img src='https://img.shields.io/badge/arXiv-2603.12255-b31b1b.svg'></a> &nbsp;&nbsp;&nbsp;&nbsp;
+<a href='https://eccv2026.ecva.net/'><img src='https://img.shields.io/badge/ECCV-2026-🔥-orange'></a> &nbsp;&nbsp;&nbsp;&nbsp;
 <a href='https://liuff19.github.io/Spatial-TTT/'><img src='https://img.shields.io/badge/Project-Page-Green'></a> &nbsp;&nbsp;&nbsp;&nbsp;
 <a><img src='https://img.shields.io/badge/License-MIT-blue'></a> &nbsp;&nbsp;&nbsp;&nbsp;
 
@@ -34,6 +37,7 @@
 
 ## 📢 News
 
+- **[2026/06/19]** 🔥 **Spatial-TTT** has been accepted to **ECCV 2026**!
 - **[2026/03/13]** 🎉 We release the paper on [arXiv](https://arxiv.org/abs/2603.12255)!
 - **[2026/03/13]** We release the training and evaluation code for **Spatial-TTT**, the official implementation of *Spatial-TTT: Streaming Visual-based Spatial Intelligence with Test-Time Training*.
 
